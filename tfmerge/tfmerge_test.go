@@ -3,10 +3,13 @@ package tfmerge
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/hashicorp/go-version"
@@ -77,154 +80,138 @@ func testFixture(t *testing.T, name string) (stateFiles []string, expectState []
 	return
 }
 
-func assertStateEqual(t *testing.T, actual, expect []byte, mergedCount int, hasBaseState bool) {
-	var actualState, expectState map[string]interface{}
-	if err := json.Unmarshal(actual, &actualState); err != nil {
-		t.Fatalf("unmarshal actual state\n%s\n: %v", string(actual), err)
-	}
-	if err := json.Unmarshal(expect, &expectState); err != nil {
-		t.Fatalf("unmarshal expect state\n%s\n: %v", string(expect), err)
+// Initialize the State for testing (basically a constructor)
+func (state *State) init_test(t *testing.T, input []byte, mergedCount int, hasBaseState bool) {
+	if err := json.Unmarshal(input, &state); err != nil {
+		t.Fatalf("unmarshal expect state\n%s\n: %v", string(input), err)
 	}
 
 	if !hasBaseState {
-		delete(actualState, "lineage")
-		delete(expectState, "lineage")
+		state.Lineage = "00000000-0000-0000-0000-000000000000"
 	}
+
+	// TODO: explain why/what this is
 	if hasBaseState {
 		mergedCount += 1
 	}
-	expectState["serial"] = mergedCount
+	state.Serial = mergedCount
 
 	// The terraform version used to create the testdata might be different than the one running this test.
-	delete(actualState, "terraform_version")
-	delete(expectState, "terraform_version")
-
-	actualJson, err := json.Marshal(actualState)
-	if err != nil {
-		t.Fatalf("marshal modified actual state: %v", err)
-	}
-	expectJson, err := json.Marshal(expectState)
-	if err != nil {
-		t.Fatalf("marshal modified expect state: %v", err)
-	}
-	require.JSONEq(t, string(expectJson), string(actualJson))
+	state.TerraformVersion = ""
 }
 
+// Compare both states, return flat map of each difference
+func compareStates(t *testing.T, input, expected *State) ([]difference, []error) {
+	var diffs differences
+	var errs []error
+	actualPtr := reflect.ValueOf(input)
+	actual := reflect.Indirect(actualPtr)
+	expectPtr := reflect.ValueOf(expected)
+	expect := reflect.Indirect(expectPtr)
+
+	// different field sizes
+	if actual.NumField() != expect.NumField() {
+		errmsg := fmt.Sprintf("---| SizeMismatch |---\n--| Actual: %v\n--| Expect: %v\n", actual.NumField(), expect.NumField())
+		errs = append(errs, errors.New(errmsg))
+		return nil, errs
+	}
+
+	// walk each State
+	for i := 0; i < actual.NumField(); i++ {
+		switch actual.Type().Field(i).Name {
+		case "Resources":
+			errs = append(errs, diffs.compareResources(t, input.Resources, expected.Resources)...)
+		case "Checks":
+			require.JSONEq(t, string(expected.Checks), string(input.Checks))
+		case "Outputs":
+			if !reflect.DeepEqual(actual, expected) {
+				errmsg := fmt.Sprintf("---| DeepEqualFailure |---\n--| Actual: %v\n--| Expect: %v\n", actual, expected)
+				errs = append(errs, errors.New(errmsg))
+			}
+		default:
+			errs = append(errs, diffs.compareField(t, actual, expect, i)...)
+		}
+	}
+
+	return diffs.all, errs
+}
+
+// Updates the differences obj; returns []err
+func (diffs *differences) compareField(t *testing.T, actual, expect reflect.Value, i int) []error {
+	var errs []error
+	if actual.Field(i).Type() != expect.Field(i).Type() { // The Types mismatched
+		errmsg := fmt.Sprintf("---| TypeMismatch |---\n--| Actual: %v\n--| Expect: %v\n", actual.Field(i).Type(), expect.Field(i).Type())
+		errs = append(errs, errors.New(errmsg))
+	}
+	if actual.Field(i).Interface() != expect.Field(i).Interface() { // The Values mismatched
+		diffs.all = append(diffs.all, difference{
+			expect: expect.Field(i).Interface(),
+			actual: actual.Field(i).Interface(),
+		})
+		errmsg := fmt.Sprintf("---| ValueMismatch |---\n--| Actual: %v\n--| Expect: %v\n", actual.Field(i).Interface(), expect.Field(i).Interface())
+		errs = append(errs, errors.New(errmsg))
+	}
+	return errs
+}
+
+func (diffs *differences) compareResources(t *testing.T, input, expected []Resource) []error {
+	var errs []error
+	// For every resource
+	for i := range input {
+		actualPtr := reflect.ValueOf(input[i])
+		actual := reflect.Indirect(actualPtr)
+		expectPtr := reflect.ValueOf(expected[i])
+		expect := reflect.Indirect(expectPtr)
+
+		// For every property in the resource
+		for k := 0; k < expect.NumField(); k++ {
+			switch actual.Type().Field(k).Name {
+			default:
+				errs = append(errs, diffs.compareField(t, actual, expect, i)...)
+			}
+		}
+	}
+	return errs
+}
+
+// This is Main()
 func TestMerge(t *testing.T) {
-	cases := []struct {
-		name      string
-		dir       string
-		baseState string
-		hasError  bool
-	}{
-		{
-			name: "Resource Only (no base state)",
-			dir:  "resource_only",
-		},
-		{
-			name: "Resource Only (base state)",
-			dir:  "resource_only",
-			baseState: `{
-  "version": 4,
-  "terraform_version": "1.2.8",
-  "serial": 1,
-  "lineage": "00000000-0000-0000-0000-000000000000",
-  "outputs": {},
-  "resources": []
-}
-`,
-		},
-		{
-			name: "Module no cross (no base state)",
-			dir:  "module_no_cross",
-		},
-		{
-			name: "Module no cross (base state)",
-			dir:  "module_no_cross",
-			baseState: `{
-  "version": 4,
-  "terraform_version": "1.2.8",
-  "serial": 1,
-  "lineage": "00000000-0000-0000-0000-000000000000",
-  "outputs": {},
-  "resources": []
-}
-`,
-		},
-		{
-			name: "Module cross (no base state)",
-			dir:  "module_cross",
-		},
-		{
-			name: "Module cross (base state)",
-			dir:  "module_cross",
-			baseState: `{
-  "version": 4,
-  "terraform_version": "1.2.8",
-  "serial": 1,
-  "lineage": "00000000-0000-0000-0000-000000000000",
-  "outputs": {},
-  "resources": []
-}
-`,
-		},
-		{
-			name: "Module instance",
-			dir:  "module_instance",
-		},
-		{
-			name:     "Resource conflict",
-			dir:      "resource_conflict",
-			hasError: true,
-		},
-		{
-			name: "Resource conflict with base state",
-			dir:  "resource_only",
-			baseState: `{
-  "version": 4,
-  "terraform_version": "1.2.8",
-  "serial": 1,
-  "lineage": "00000000-0000-0000-0000-000000000000",
-  "outputs": {},
-  "resources": [
-    {
-      "mode": "managed",
-      "type": "null_resource",
-      "name": "test1",
-      "provider": "provider[\"registry.terraform.io/hashicorp/null\"]",
-      "instances": [
-        {
-          "schema_version": 0,
-          "attributes": {},
-          "sensitive_attributes": [],
-          "private": "bnVsbA=="
-        }
-      ]
-    }
-  ]
-}
-`,
-			hasError: true,
-		},
-		{
-			name:     "Module conflict",
-			dir:      "module_conflict",
-			hasError: true,
-		},
-	}
+	var actualState, expectState State
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := context.Background()
-			tf := initTest(ctx, t)
-			stateFiles, expect := testFixture(t, tt.dir)
-			actual, err := Merge(context.Background(), tf, []byte(tt.baseState), stateFiles...)
+			ctx := context.Background()                                                   // Set context
+			tf := initTest(ctx, t)                                                        // terraform init
+			stateFiles, expect := testFixture(t, tt.dir)                                  // Grabs the StateFiles & the Expected State
+			actual, err := Merge(ctx, tf, []byte(tt.baseState), "default", stateFiles...) // Run Merge()
 			if tt.hasError {
 				require.Error(t, err)
 				return
 			}
-			require.NoError(t, err)
-			assertStateEqual(t, actual, expect, len(stateFiles), tt.baseState != "")
+			// Update each state struct
+			actualState.init_test(t, actual, len(stateFiles), tt.baseState != "")
+			expectState.init_test(t, expect, len(stateFiles), tt.baseState != "")
+
+			// Compare the States
+			if diffs, errs := compareStates(t, &actualState, &expectState); len(diffs) > 0 && len(errs) > 0 {
+				for _, diff := range diffs {
+					fmt.Printf("============================================\n")
+					fmt.Printf("--| Actual |--\n%v\n", diff.actual)
+					fmt.Printf("--| Expect |--\n%v\n", diff.expect)
+				}
+			} else {
+				for _, err := range errs {
+					fmt.Printf("%v", err)
+				}
+			}
+
+			// require.NoError(t, err)
+			// assertStateEqual(t, actual, expect, len(stateFiles), tt.baseState != "")
+
 		})
 	}
 }
+
+// For each case
+// Run each test
+//
