@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"local/tfmerge"
 	"log"
 	"os"
 
@@ -13,7 +14,8 @@ import (
 	"github.com/hashicorp/hc-install/product"
 	"github.com/hashicorp/hc-install/src"
 	"github.com/hashicorp/terraform-exec/tfexec"
-	"github.com/magodo/tfmerge/tfmerge"
+
+	// "github.com/magodo/tfmerge/tfmerge"
 	"github.com/urfave/cli/v2"
 )
 
@@ -40,6 +42,12 @@ func main() {
 				EnvVars: []string{"TFMERGE_CHDIR"},
 				Usage:   "Switch to a different working directory before executing",
 			},
+			&cli.StringFlag{
+				Name:    "ifConflict",
+				EnvVars: []string{"TFMERGE_IFCONFLICT"},
+				Aliases: []string{"resolveBy", "ic", "r"},
+				Usage:   "How to handle merge conflicts",
+			},
 		},
 		Action: func(ctx *cli.Context) error {
 			log.SetOutput(io.Discard)
@@ -48,6 +56,7 @@ func main() {
 				log.SetOutput(os.Stderr)
 			}
 			cwd, err := os.Getwd()
+			resolution := ""
 			if err != nil {
 				return err
 			}
@@ -56,17 +65,21 @@ func main() {
 				cwd = v
 			}
 
+			if v := ctx.String("ifConflict"); v != "" {
+				resolution = v
+			}
+
 			tf, err := initTerraform(context.Background(), cwd)
 			if err != nil {
 				return err
 			}
 
-			baseState, err := tf.StatePull(ctx.Context)
+			pulledState, err := tf.StatePull(ctx.Context)
 			if err != nil {
 				return fmt.Errorf("pulling state file of the working directory: %v", err)
 			}
 
-			b, err := tfmerge.Merge(ctx.Context, tf, []byte(baseState), ctx.Args().Slice()...)
+			b, err := tfmerge.Merge(ctx.Context, tf, []byte(pulledState), resolution, ctx.Args().Slice()...)
 			if err != nil {
 				return err
 			}
